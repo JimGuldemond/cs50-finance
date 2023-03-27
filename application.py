@@ -1,13 +1,13 @@
 import os
+import json
+import time
+import base64
 
 from cs50 import SQL
-from flask import Flask, flash, redirect, render_template, request, session
+from flask import Flask, flash, redirect, render_template, request, session, url_for, jsonify
 from flask_session import Session
-from tempfile import mkdtemp
-from werkzeug.exceptions import default_exceptions, HTTPException, InternalServerError
-from werkzeug.security import check_password_hash, generate_password_hash
-
-from helpers import apology, login_required, lookup, usd
+from helpers import info_pics, info_descr, randomise, randomise_2, avg_interval, img_generator
+from datetime import datetime
 
 # Configure application
 app = Flask(__name__)
@@ -15,321 +15,138 @@ app = Flask(__name__)
 # Ensure templates are auto-reloaded
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
+# Configure CS50 Library to use SQLite database
+db = SQL("sqlite:///gaitquiz.db")
 
-# Ensure responses aren't cached
+# Configure session
+random_key = str(os.urandom(8))
+app.config['SECRET_KEY'] = random_key
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config["SESSION_COOKIE_NAME"] = "session"
+app.config["SESSION_PERMANENT"] = False
+Session(app)
+
+# Generate random session id
+@app.before_first_request
+def id():
+    id = str(os.urandom(8))
+    return id
+
 @app.after_request
 def after_request(response):
+    """Ensure responses aren't cached"""
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Expires"] = 0
     response.headers["Pragma"] = "no-cache"
+
     return response
 
+# Generate copy of the generated random id, so that id stays the same during the session
+def id_saver(id=id()):
+    return id
 
-# Custom filter
-app.jinja_env.filters["usd"] = usd
-
-# Configure session to use filesystem (instead of signed cookies)
-app.config["SESSION_FILE_DIR"] = mkdtemp()
-app.config["SESSION_PERMANENT"] = False
-app.config["SESSION_TYPE"] = "filesystem"
-Session(app)
-
-# Configure CS50 Library to use SQLite database
-db = SQL("sqlite:///finance.db")
-
-# Make sure API key is set
-if not os.environ.get("API_KEY"):
-    raise RuntimeError("API_KEY not set")
-
-BUY_CATEGORY = 'Bought'
-SELL_CATEGORY = 'Sold'
-
-
-@app.route("/")
-@login_required
+# Index contains variables that refer to locations of stored images
+@app.route("/", methods=["GET", "POST"])
 def index():
-    """Show portfolio of stocks"""
-    pocket = getPocket()
 
-    rows = db.execute(
-        "SELECT cash FROM users WHERE id = ?", session["user_id"]
-    )
-
-    total_pocket = 0
-
-    for stock in pocket:
-        quote = lookup(stock["symbol"])
-        stock["current_price"] = quote['price']
-        stock["total_value"] = stock["shares"] * quote['price']
-        total_pocket += stock["total_value"]
-
-    cash = rows[0]["cash"]
-    totals = {
-        "cash": cash,
-        "pocket": total_pocket,
-        "grand": cash + total_pocket
-    }
-
-    return render_template("index.html", pocket=pocket, totals=totals)
+    index = url_for('static', filename='index2.jpg')
+    redline = url_for('static', filename='redline.jpg')
+    whichleg = url_for('static', filename='whichleg.jpg')
+    logo_img_small = url_for('static', filename='logo-geknipt.png')
+    return render_template("index.html", index=index, logo_img_small=logo_img_small, redline=redline, whichleg=whichleg)
 
 
-@app.route("/buy", methods=["GET", "POST"])
-@login_required
-def buy():
-    """Buy shares of stock"""
+@app.route("/picture-quiz", methods=["GET", "POST"])
+def picture_quiz(id=id_saver()):
 
-    # User reached route via POST (as by submitting a form via POST)
+    time = datetime.now() # Time represents the timestamp at the moment the user clicks a button with an answer
+    info_temp = info_pics() # Info_temp gets information about the pictures from the helpers file. Every picture is linked to a correct answer
+    random_id = randomise() # Random_id uses a function from the helpers file to generate a random id number to generate a question with
+    correct_answer = info_temp[random_id] # The random id is linked to the information from the info function, which defines the correct answer
+    file = str(random_id) + ".JPG" # File represents the name of the file we want to retrieve from the static folder, containing the image
+    quiz_img = url_for('static', filename=file)
+    logo_img = url_for('static', filename='logo-geknipt.png')
+
+
+    id = random_key
+
+
+    try:
+        # Intervals is a variable that takes the timestamps from the user's last three answers
+        intervals = db.execute("SELECT time FROM results WHERE id=? AND picdesc=? ORDER BY answer_id desc LIMIT 3", id, "pic")
+        # Avg_time takes the aforementioned variable 'intervals', and passes it through a function from the helpers file. The result is the average time in seconds
+        avg_time = avg_interval(intervals)
+        # The progress bar on the html page has a width of 150. A full bar represents the highest speed. I subtract my average time, multiplied by ten for added sensitivity
+        score = 150 - (avg_time * 10)
+    except:
+        # It's impossible to retrieve information about the average time if less than three answers have been given by the user so far.
+        avg_time = "Please answer more questions first"
+        score = 0
+
     if request.method == "POST":
+        """ The button click on the html page triggers an event that is contained in the java file. The value from the html button is compared to the correct answer.
+            The result from the comparison that happens in the java file is sent here by means of a JSON request. User_answer is a variable that contains a string.
+            The string can either be 'correct', or 'incorrect'.
+        """
+        user_answer = request.get_json()["answer"]
+        # After user_answer is defined ('correct' or 'incorrect'), all the required information is added to the database
+        db.execute("INSERT INTO results (correct, id, time, picdesc) VALUES(?, ?, ?, ?)", user_answer, id, time, "pic")
+        return render_template("quiz.html", correct_answer=correct_answer, quiz_img=quiz_img)
 
-        symbol = request.form.get("symbol")
-        shares = request.form.get("shares")
+    return render_template("quiz.html", correct_answer=correct_answer, quiz_img=quiz_img, logo_img=logo_img, score=score)
 
-        # validations
-        if not symbol:
-            return apology("must provide symbol", 400)
+@app.route("/description-quiz", methods=["GET", "POST"])
+def description_quiz(id=id_saver()):
 
-        if not shares.isdigit() or int(shares) < 0:
-            return apology("shares must be apositive integer", 400)
+    time = datetime.now() # Time represents the timestamp at the moment the user clicks a button with an answer
+    info_temp = randomise_2() # Info_temp gets information about the questions from the helpers file. Every question is linked to a correct answer
 
-        quote = lookup(symbol)
-        if not quote:
-            return apology("quote not found", 400)
+    for var in info_temp:  # Info_temp contains a tuple. The key represents the question and the value represents the answer
+        question = info_temp[0]
+        correct_answer = info_temp[1]
 
-        rows = db.execute(
-            "SELECT cash FROM users WHERE id = ?", session["user_id"]
-        )
+    logo_img = url_for('static', filename='gaitquiz-logo-small.png') # Logo_img is a picture in the static folder that I need for the html page
+    image_memory = img_generator(question) # Img_generator is a function from the helpers file that takes a background and adds text to it. The added text is our question.
 
-        cash = rows[0]['cash']
-        total_price = int(shares) * quote['price']
-        if total_price > cash:
-            return apology("not cash enough", 403)
+    try:
+        # Intervals is a variable that takes the timestamps from the user's last three answers
+        intervals = db.execute("SELECT time FROM results WHERE id=? AND picdesc=? ORDER BY answer_id desc LIMIT 3", id, "desc")
+        # Avg_time takes the aforementioned variable 'intervals', and passes it through a function from the helpers file. The result is the average time in seconds
+        avg_time = avg_interval(intervals)
+        # The progress bar on the html page has a width of 150. A full bar represents the highest speed. I subtract my average time, multiplied by ten for added sensitivity
+        score = 150 - (avg_time * 7)
+    except:
+        # It's impossible to retrieve information about the average time if less than three answers have been given by the user so far.
+        avg_time = "Please answer more questions first"
+        score = 0
 
-        cash = cash - total_price
-        db.execute(
-            "UPDATE users SET cash = ? WHERE id = ?",
-            cash,
-            session["user_id"]
-        )
-
-        db.execute(
-            "INSERT INTO transactions (symbol, price, share, category, user_id) VALUES (?, ?, ?, ?, ?)",
-            symbol,
-            quote['price'],
-            int(shares),
-            BUY_CATEGORY,
-            session["user_id"]
-        )
-
-        return redirect("/")
-
-    # User reached route via GET (as by clicking a link or via redirect)
-    else:
-        return render_template("buy.html")
-
-
-@app.route("/history")
-@login_required
-def history():
-    """Show history of transactions"""
-
-    transactions = db.execute("""
-        SELECT symbol, price, share, category, created_at
-        FROM transactions
-        WHERE user_id = ?
-        ORDER BY created_at DESC
-    """, session["user_id"])
-
-    return render_template("history.html", transactions=transactions)
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    """Log user in"""
-
-    # Forget any user_id
-    session.clear()
-
-    # User reached route via POST (as by submitting a form via POST)
     if request.method == "POST":
+        """ The button click on the html page triggers an event that is contained in the java file. The value from the html button is compared to the correct answer.
+        The result from the comparison that happens in the java file is sent here by means of a JSON request. User_answer is a variable that contains a string.
+        The string can either be 'correct', or 'incorrect'.
+        """
+        user_answer = request.get_json()["answer"]
+        # After user_answer is defined ('correct' or 'incorrect'), all the required information is added to the database
+        db.execute("INSERT INTO results (correct, id, time, picdesc) VALUES(?, ?, ?, ?)", user_answer, id, time, "desc")
+        # Image_memory is a variable that contains an encoded image. Before passing it to the html page, it is decoded
+        return render_template("quiz.html", id=id, correct_answer=correct_answer, question=question, img=image_memory.decode('utf-8'))
 
-        # Ensure username was submitted
-        if not request.form.get("username"):
-            return apology("must provide username", 403)
-
-        # Ensure password was submitted
-        elif not request.form.get("password"):
-            return apology("must provide password", 403)
-
-        # Query database for username
-        rows = db.execute("SELECT * FROM users WHERE username = ?",
-                          request.form.get("username"))
-
-        # Ensure username exists and password is correct
-        if len(rows) != 1 or not check_password_hash(rows[0]["hash"], request.form.get("password")):
-            return apology("invalid username and/or password", 403)
-
-        # Remember which user has logged in
-        session["user_id"] = rows[0]["id"]
-
-        # Redirect user to home page
-        return redirect("/")
-
-    # User reached route via GET (as by clicking a link or via redirect)
-    else:
-        return render_template("login.html")
+    return render_template("description_quiz.html", correct_answer=correct_answer, question=question, logo_img=logo_img, score=score,
+    img=image_memory.decode('utf-8'))
 
 
-@app.route("/logout")
-def logout():
-    """Log user out"""
+@app.route("/mobilewarning", methods=["GET", "POST"])
+def mobilewarning(id=id_saver()):
+    logo_img_small = url_for('static', filename='gaitquiz-logo-small.png')
+    return render_template("mobilewarning.html", logo_img_small=logo_img_small)
 
-    # Forget any user_id
-    session.clear()
-
-    # Redirect user to login form
-    return redirect("/")
+if __name__ == "__main__":
+    app.run()#(debug=False, host='0,0,0,0')
 
 
-@app.route("/quote", methods=["GET", "POST"])
-@login_required
-def quote():
-    """Get stock quote."""
-    # User reached route via POST (as by submitting a form via POST)
-    if request.method == "POST":
-
-        symbol = request.form.get("symbol")
-
-        if not symbol:
-            return apology("must provide symbol", 400)
-
-        quote = lookup(symbol)
-        if not quote:
-            return apology("quote not found", 400)
-
-        return render_template("quoted.html", quote=quote)
-
-    # User reached route via GET (as by clicking a link or via redirect)
-    else:
-        return render_template("quote.html")
 
 
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    """Register user"""
-
-    # User reached route via POST (as by submitting a form via POST)
-    if request.method == "POST":
-
-        username = request.form.get("username")
-        password = request.form.get("password")
-        confirmation = request.form.get("confirmation")
-
-        # Ensure username was submitted
-        if not username:
-            return apology("must provide username", 400)
-
-        # Ensure password was submitted
-        elif not password:
-            return apology("must provide password", 400)
-
-        elif password != confirmation:
-            return apology("password and confirmation must be the same", 400)
-
-         # Query database for username
-        rows = db.execute("SELECT * FROM users WHERE username = ?", username)
-        if len(rows) > 0:
-            return apology("username already exists", 400)
-
-        _id = db.execute("INSERT INTO users (username, hash) VALUES (?, ?);",
-                         username, generate_password_hash(password))
-
-        # Remember which user has logged in
-        session["user_id"] = _id
-
-        # Redirect user to home page
-        return redirect("/")
-
-    # User reached route via GET (as by clicking a link or via redirect)
-    else:
-        return render_template("register.html")
 
 
-@app.route("/sell", methods=["GET", "POST"])
-@login_required
-def sell():
-    """Sell shares of stock"""
-
-    # User reached route via POST (as by submitting a form via POST)
-    if request.method == "POST":
-        symbol = request.form.get("symbol")
-        shares = request.form.get("shares")
-
-        if not symbol:
-            return apology("must select a stock", 400)
-
-        if not shares.isdigit() or int(shares) < 0:
-            return apology("shares must be apositive integer", 400)
-
-        pocket = getPocket(symbol)
-
-        if not pocket:
-            return apology("you do not have this stock in pocket", 400)
-
-        if int(shares) > pocket[0]["shares"]:
-            return apology("volume of shares exceeded", 400)
-
-        quote = lookup(symbol)
-        total_sell = int(shares) * quote['price']
-
-        db.execute(
-            "UPDATE users SET cash = (cash + ?) WHERE id = ?",
-            total_sell,
-            session["user_id"]
-        )
-
-        db.execute(
-            "INSERT INTO transactions (symbol, price, share, category, user_id) VALUES (?, ?, ?, ?, ?)",
-            symbol,
-            quote['price'],
-            int(shares),
-            SELL_CATEGORY,
-            session["user_id"]
-        )
-
-        return redirect("/")
-    else:
-        pocket = getPocket()
-        return render_template("sell.html", pocket=pocket)
 
 
-def errorhandler(e):
-    """Handle error"""
-    if not isinstance(e, HTTPException):
-        e = InternalServerError()
-    return apology(e.name, e.code)
-
-
-def getPocket(symbol=None):
-    query = """
-        SELECT symbol, shares
-        FROM (
-	        SELECT t.symbol, SUM(CASE WHEN t.category = ? THEN t.share WHEN t.category = ? THEN -t.share ELSE 0 END) AS shares
-	        FROM transactions t
-	        WHERE t.user_id = ?
-	        GROUP BY t.symbol
-        ) r
-        WHERE r.shares > 0{}
-        ORDER BY r.symbol ASC
-    """
-
-    whereSymbol = ""
-    if symbol:
-        whereSymbol = " AND r.symbol = '{}'".format(symbol)
-
-    query = query.format(whereSymbol)
-    return db.execute(query, BUY_CATEGORY, SELL_CATEGORY, session["user_id"])
-
-
-# Listen for errors
-for code in default_exceptions:
-    app.errorhandler(code)(errorhandler)
